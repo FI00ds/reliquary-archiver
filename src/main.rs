@@ -330,12 +330,12 @@ where
                     use std::io::Write;
                 
                     print!("{}", msg);
-                    if let Err(e) = std::io::stdout().flush() {
+                    if std::io::stdout().flush().is_err() {
                         return false;
                     }
 
                     let mut input = String::new();
-                    if let Err(e) = std::io::stdin().read_line(&mut input) {
+                    if std::io::stdin().read_line(&mut input).is_err() {
                         return false;
                     }
 
