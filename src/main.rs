@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::io::Write;
 
 #[cfg(feature = "pcap")] use capture::PCAP_FILTER;
 
@@ -73,6 +74,87 @@ struct Args {
     /// Don't wait for enter to be pressed after capturing
     #[arg(short, long)]
     exit_after_capture: bool,
+    /// Path to save PCAP packet dump to (optional, defaults to packet_dump.pcap)
+    #[arg(long)]
+    packet_dump: Option<PathBuf>,
+}
+
+/// Packet dumper for saving raw packet data to a PCAP file
+struct PacketDumper {
+    file: File,
+    packet_count: usize,
+    start_time: std::time::SystemTime,
+}
+
+impl PacketDumper {
+    fn new(dump_path: Option<PathBuf>) -> Result<Self, std::io::Error> {
+        let dump_path = dump_path.unwrap_or_else(|| {
+            PathBuf::from("packet_dump.pcap")
+        });
+
+        let mut file = File::create(&dump_path)?;
+        info!("Packet dump will be saved to: {}", dump_path.canonicalize()?.display());
+
+        // Write PCAP file header
+        // Magic number (0xa1b2c3d4 for big-endian)
+        file.write_all(&0xa1b2c3d4u32.to_be_bytes())?;
+        // Version major (2)
+        file.write_all(&2u16.to_be_bytes())?;
+        // Version minor (4)
+        file.write_all(&4u16.to_be_bytes())?;
+        // Timezone offset (0 for UTC)
+        file.write_all(&0i32.to_be_bytes())?;
+        // Timestamp accuracy (0 for unknown)
+        file.write_all(&0u32.to_be_bytes())?;
+        // Snapshot length (65535 for max)
+        file.write_all(&65535u32.to_be_bytes())?;
+        // Link layer header type (1 for Ethernet)
+        file.write_all(&1u32.to_be_bytes())?;
+
+        Ok(PacketDumper {
+            file,
+            packet_count: 0,
+            start_time: std::time::SystemTime::now(),
+        })
+    }
+
+    fn write_packet(&mut self, packet: &capture::Packet) -> Result<(), std::io::Error> {
+        let now = std::time::SystemTime::now();
+        let duration = now.duration_since(self.start_time)
+            .unwrap_or_default();
+        
+        // Calculate timestamp in seconds and microseconds since start
+        let timestamp_sec = duration.as_secs() as u32;
+        let timestamp_usec = duration.subsec_micros();
+        
+        // PCAP packet header
+        // Timestamp seconds
+        self.file.write_all(&timestamp_sec.to_be_bytes())?;
+        // Timestamp microseconds
+        self.file.write_all(&timestamp_usec.to_be_bytes())?;
+        // Captured packet length
+        self.file.write_all(&(packet.data.len() as u32).to_be_bytes())?;
+        // Original packet length
+        self.file.write_all(&(packet.data.len() as u32).to_be_bytes())?;
+        
+        // Write packet data
+        self.file.write_all(&packet.data)?;
+        
+        self.packet_count += 1;
+        
+        if self.packet_count % 100 == 0 {
+            debug!("Dumped {} packets", self.packet_count);
+        }
+
+        Ok(())
+    }
+
+    fn finalize(&mut self) {
+        if let Err(e) = self.file.flush() {
+            error!("Failed to flush packet dump file: {}", e);
+        }
+        info!("Packet dump completed: {} packets saved", self.packet_count);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -125,14 +207,21 @@ fn main() {
         let sniffer = GameSniffer::new().set_initial_keys(database.keys.clone());
         let exporter = OptimizerExporter::new(database);
 
+        // Initialize packet dumper
+        let mut packet_dumper = PacketDumper::new(args.packet_dump.clone())
+            .expect("Failed to initialize packet dumper");
+
         let capture_mode = CaptureMode::from_args(&args);
         let export = match capture_mode {
-            CaptureMode::Live => live_capture_wrapper(&args, exporter, sniffer),
+            CaptureMode::Live => live_capture_wrapper(&args, exporter, sniffer, &mut packet_dumper),
             #[cfg(feature = "pcap")]
-            CaptureMode::Pcap(path) => capture_from_pcap(&args, exporter, sniffer, path),
+            CaptureMode::Pcap(path) => capture_from_pcap(&args, exporter, sniffer, path, &mut packet_dumper),
             #[cfg(feature = "pktmon")]
-            CaptureMode::Etl(path) => capture_from_etl(&args, exporter, sniffer, path),
+            CaptureMode::Etl(path) => capture_from_etl(&args, exporter, sniffer, path, &mut packet_dumper),
         };
+
+        // Finalize packet dump
+        packet_dumper.finalize();
 
         if let Some(export) = export {
             let file_name = Local::now().format("archive_output-%Y-%m-%dT%H-%M-%S.json").to_string();
@@ -322,6 +411,7 @@ fn capture_from_pcap<E>(
     mut exporter: E,
     mut sniffer: GameSniffer,
     pcap_path: PathBuf,
+    packet_dumper: &mut PacketDumper,
 ) -> Option<E::Export>
 where
     E: Exporter,
@@ -331,6 +421,17 @@ where
     capture.filter(PCAP_FILTER, false).unwrap();
 
     while let Ok(packet) = capture.next_packet() {
+        // Create a capture::Packet for dumping
+        let capture_packet = capture::Packet {
+            source_id: 0, // Use 0 for file captures
+            data: packet.data.to_vec(),
+        };
+        
+        // Dump the packet if requested
+        if let Err(e) = packet_dumper.write_packet(&capture_packet) {
+            warn!("Failed to dump packet: {}", e);
+        }
+        
         match file_process_packet(&mut exporter, &mut sniffer, packet.data.to_vec()) {
             ProcessResult::Continue => {},
             ProcessResult::Stop => break,
@@ -347,6 +448,7 @@ fn capture_from_etl<E>(
     mut exporter: E,
     mut sniffer: GameSniffer,
     etl_path: PathBuf,
+    packet_dumper: &mut PacketDumper,
 ) -> Option<E::Export>
 where
     E: Exporter,
@@ -358,6 +460,17 @@ where
     while let Ok(packet) = capture.next_packet() {
         match packet.payload {
             pktmon::PacketPayload::Ethernet(payload) => {
+                // Create a capture::Packet for dumping
+                let capture_packet = capture::Packet {
+                    source_id: packet.component_id as u64,
+                    data: payload.clone(),
+                };
+                
+                // Dump the packet if requested
+                if let Err(e) = packet_dumper.write_packet(&capture_packet) {
+                    warn!("Failed to dump packet: {}", e);
+                }
+                
                 match file_process_packet(&mut exporter, &mut sniffer, payload) {
                     ProcessResult::Continue => {},
                     ProcessResult::Stop => break,
@@ -371,7 +484,7 @@ where
     exporter.export()
 }
 
-fn live_capture_wrapper<E>(args: &Args, exporter: E, sniffer: GameSniffer) -> Option<E::Export>
+fn live_capture_wrapper<E>(args: &Args, exporter: E, sniffer: GameSniffer, packet_dumper: &mut PacketDumper) -> Option<E::Export>
 where
     E: Exporter,
 {
@@ -388,23 +501,23 @@ where
             info!("WebSocket server running on ws://localhost:{}/ws", port);
             info!("You can connect to this WebSocket server to receive real-time relic updates");
 
-            let result = live_capture(args, exporter, sniffer);
+            let result = live_capture(args, exporter, sniffer, packet_dumper);
 
             ws_server.abort();
 
             result
         } else {
-            live_capture(args, exporter, sniffer)
+            live_capture(args, exporter, sniffer, packet_dumper)
         }
     }
 
     #[cfg(not(feature = "stream"))] {
-        live_capture(args, exporter, sniffer)
+        live_capture(args, exporter, sniffer, packet_dumper)
     }
 }
 
 #[instrument(skip_all)]
-fn live_capture<E>(args: &Args, exporter: Arc<Mutex<E>>, mut sniffer: GameSniffer) -> Option<E::Export>
+fn live_capture<E>(args: &Args, exporter: Arc<Mutex<E>>, mut sniffer: GameSniffer, packet_dumper: &mut PacketDumper) -> Option<E::Export>
 where
     E: Exporter,
 {
@@ -491,6 +604,11 @@ where
                 if poisoned_sources.contains(&packet.source_id) {
                     // We already know that this source is poisoned, so we can skip it
                     continue;
+                }
+
+                // Dump the packet if requested
+                if let Err(e) = packet_dumper.write_packet(&packet) {
+                    warn!("Failed to dump packet: {}", e);
                 }
 
                 match sniffer.receive_packet(packet.data) {
