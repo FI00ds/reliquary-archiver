@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures::channel::{mpsc, oneshot};
@@ -8,14 +8,14 @@ use futures::executor::block_on;
 use futures::lock::Mutex;
 use futures::sink::SinkExt;
 use futures::stream::FusedStream;
-use futures::{select, stream, FutureExt, Stream, StreamExt};
+use futures::{FutureExt, Stream, StreamExt, select, stream};
 use reliquary::network::command::command_id::{PlayerGetTokenScRsp, PlayerLoginFinishScRsp, PlayerLoginScRsp};
 use reliquary::network::command::proto::PlayerGetTokenScRsp::PlayerGetTokenScRsp as PlayerGetTokenScRspProto;
 use reliquary::network::command::{GameCommand, GameCommandError};
 use reliquary::network::{ConnectionPacket, GamePacket, GameSniffer, NetworkError};
-use reliquary_archiver::export::database::{get_database, Database};
-use reliquary_archiver::export::fribbels::{Export, OptimizerEvent, OptimizerExporter};
 use reliquary_archiver::export::Exporter;
+use reliquary_archiver::export::database::{Database, get_database};
+use reliquary_archiver::export::fribbels::{Export, OptimizerEvent, OptimizerExporter};
 use tokio::pin;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -90,9 +90,6 @@ pub struct MultiAccountManager {
     /// Track which conversation belongs to which account UID
     uid_to_conv: HashMap<u32, u32>,
 
-    /// Initial decryption keys shared across all exporters
-    initial_keys: HashMap<u32, Vec<u8>>,
-
     /// Unified event channel for all account lifecycle and exporter events
     event_tx: broadcast::Sender<AccountEvent>,
 
@@ -101,12 +98,11 @@ pub struct MultiAccountManager {
 }
 
 impl MultiAccountManager {
-    pub fn new(initial_keys: HashMap<u32, Vec<u8>>) -> Self {
+    pub fn new() -> Self {
         let (event_tx, _) = broadcast::channel(100);
         Self {
             exporters: HashMap::new(),
             uid_to_conv: HashMap::new(),
-            initial_keys,
             event_tx,
             subscription_tasks: HashMap::new(),
         }
@@ -232,7 +228,7 @@ pub fn archiver_worker(manager: Arc<Mutex<MultiAccountManager>>) -> impl Stream<
         let (sender, mut receiver) = mpsc::channel(100);
 
         let database = get_database();
-        let sniffer = GameSniffer::new().set_initial_keys(database.keys.clone());
+        let sniffer = GameSniffer::new();
 
         let (mut recorded_tx, recorded_rx) = mpsc::channel(100);
 
@@ -282,16 +278,20 @@ pub fn archiver_worker(manager: Arc<Mutex<MultiAccountManager>>) -> impl Stream<
                             let export = if let Some(target_uid) = uid {
                                 // Export specific account
                                 let exporter_opt = manager.lock().await.get_account_exporter(target_uid);
-                                if let Some(exporter) = exporter_opt {
-                                    exporter.lock().await.export()
+                                if let Some(exporter) = exporter_opt
+                                && let exporter = exporter.lock().await
+                                && exporter.is_initialized() {
+                                    exporter.export()
                                 } else {
                                     None
                                 }
                             } else {
                                 // Export first account
                                 let accounts = manager.lock().await.get_all_accounts();
-                                if let Some((_, exporter)) = accounts.first() {
-                                    exporter.lock().await.export()
+                                if let Some((_, exporter)) = accounts.first()
+                                && let exporter = exporter.lock().await
+                                && exporter.is_initialized() {
+                                    exporter.export()
                                 } else {
                                     None
                                 }
@@ -422,7 +422,9 @@ async fn live_capture(
                                     metric_tx.send(SnifferMetric::ConnectionEstablished).await.ok();
 
                                     if cfg!(all(feature = "pcap", windows)) {
-                                        info!("If the program gets stuck at this point for longer than 10 seconds, please try the pktmon release from https://github.com/IceDynamix/reliquary-archiver/releases/latest");
+                                        info!(
+                                            "If the program gets stuck at this point for longer than 10 seconds, please try the pktmon release from https://github.com/IceDynamix/reliquary-archiver/releases/latest"
+                                        );
                                     }
                                 }
                                 ConnectionPacket::Disconnected => {
@@ -437,6 +439,12 @@ async fn live_capture(
                                         info!(conv_id, "detected login start");
                                     }
 
+                                    // Route command to the correct exporter
+                                    let exporter = {
+                                        let mut mgr = manager.lock().await;
+                                        mgr.get_or_create_exporter(conv_id)
+                                    };
+
                                     // Check if this is a UID discovery packet and register it if so
                                     if command.command_id == PlayerGetTokenScRsp {
                                         if let Ok(token_rsp) = command.parse_proto::<PlayerGetTokenScRspProto>() {
@@ -447,12 +455,6 @@ async fn live_capture(
                                             metric_tx.sender.send(WorkerEvent::AccountDiscovered { uid }).await.ok();
                                         }
                                     }
-
-                                    // Route command to the correct exporter
-                                    let exporter = {
-                                        let mut mgr = manager.lock().await;
-                                        mgr.get_or_create_exporter(conv_id)
-                                    };
 
                                     exporter.lock().await.read_command(command);
                                 }
@@ -480,5 +482,6 @@ async fn live_capture(
         }
 
         info!("capture ended, restarting...");
+        tokio::time::sleep(Duration::from_secs(10)).await;
     }
 }

@@ -8,12 +8,10 @@ use reliquary::resource::excel::{
     RelicMainAffixConfigMap, RelicSetConfigMap, RelicSubAffixConfigMap,
 };
 use reliquary::resource::{ResourceMap, TextMapEntry};
-use ureq::serde::de::DeserializeOwned;
 use ureq::serde::Serialize;
-use ureq::serde_json::Value;
+use ureq::serde::de::DeserializeOwned;
 
 const BASE_RESOURCE_URL: &str = "https://gitlab.com/Dimbreath/turnbasedgamedata/-/raw/main";
-const KEY_URL: &str = "https://raw.githubusercontent.com/tamilpp25/Iridium-SR/refs/heads/main/data/Keys.json";
 
 macro_rules! download_config {
     ($t:ty, $ex:expr, [$($url:expr),+ $(,)?]) => {
@@ -100,8 +98,6 @@ fn main() {
     download_config!(RelicSubAffixConfigMap);
 
     save_text_map(&text_hashes, "EN");
-
-    write_to_out(download_as_json::<Value>(KEY_URL), "keys.json");
 
     #[cfg(target_os = "windows")]
     {

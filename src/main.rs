@@ -17,9 +17,9 @@ use capture::PCAP_FILTER;
 use chrono::Local;
 use clap::Parser;
 use futures::lock::Mutex as FuturesMutex;
-use futures::{future, select, FutureExt, StreamExt};
-use reliquary::network::command::command_id::{PlayerLoginFinishScRsp, PlayerLoginScRsp};
+use futures::{FutureExt, StreamExt, future, select};
 use reliquary::network::command::GameCommandError;
+use reliquary::network::command::command_id::{PlayerLoginFinishScRsp, PlayerLoginScRsp};
 use reliquary::network::{ConnectionPacket, GamePacket, GameSniffer, NetworkError};
 use tokio::pin;
 use tracing::instrument::WithSubscriber;
@@ -28,7 +28,7 @@ use tracing::{debug, error, info, instrument, warn};
 use tracing_subscriber::filter::Filtered;
 use tracing_subscriber::fmt::{MakeWriter, SubscriberBuilder};
 use tracing_subscriber::prelude::*;
-use tracing_subscriber::{reload, EnvFilter, Layer, Registry};
+use tracing_subscriber::{EnvFilter, Layer, Registry, reload};
 
 #[cfg(feature = "stream")]
 mod websocket;
@@ -39,9 +39,9 @@ mod rgui;
 #[cfg(windows)]
 mod update;
 
+use reliquary_archiver::export::Exporter;
 use reliquary_archiver::export::database::Database;
 use reliquary_archiver::export::fribbels::OptimizerExporter;
-use reliquary_archiver::export::Exporter;
 
 mod capture;
 mod scopefns;
@@ -285,7 +285,7 @@ async fn capture(args: Args) {
     // Headless/CLI mode
     {
         let database = Database::new();
-        let sniffer = GameSniffer::new().set_initial_keys(database.keys.clone());
+        let sniffer = GameSniffer::new();
         let exporter = OptimizerExporter::new();
 
         let capture_mode = CaptureMode::from_args(&args);
@@ -364,7 +364,17 @@ impl std::io::Write for VecWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let str = String::from_utf8_lossy(buf);
         let lines = str.lines().map(|s| s.to_string());
-        LOG_BUFFER.lock().unwrap().extend(lines);
+        {
+            let mut buffer = LOG_BUFFER.lock().unwrap();
+            buffer.extend(lines);
+
+            // Limit the buffer size to prevent unbounded memory growth, keeping only the most recent 100000 lines
+            // (assuming an average of ~100 bytes per log line, this would use around 10MB of memory)
+            if buffer.len() > 100000 {
+                let range = 0..buffer.len() - 10000;
+                buffer.drain(range);
+            }
+        }
         LOG_NOTIFY.notify_one();
         Ok(buf.len())
     }
@@ -561,7 +571,7 @@ where
     use tokio::sync::watch;
 
     #[cfg(feature = "stream")]
-    use crate::websocket::{start_websocket_server, PortSource};
+    use crate::websocket::{PortSource, start_websocket_server};
     use crate::worker::MultiAccountManager;
 
     #[cfg(not(feature = "stream"))]
@@ -572,7 +582,7 @@ where
 
     // Always use MultiAccountManager for consistency
     let database = get_database();
-    let manager = Arc::new(FuturesMutex::new(MultiAccountManager::new(database.keys.clone())));
+    let manager = Arc::new(FuturesMutex::new(MultiAccountManager::new()));
 
     #[cfg(feature = "stream")]
     let selected_account_tx = if streaming {
@@ -669,7 +679,9 @@ async fn live_capture(
                                         info!(conv_id, "detected connection established");
 
                                         if cfg!(all(feature = "pcap", windows)) {
-                                            info!("If the program gets stuck at this point for longer than 10 seconds, please try the pktmon release from https://github.com/IceDynamix/reliquary-archiver/releases/latest");
+                                            info!(
+                                                "If the program gets stuck at this point for longer than 10 seconds, please try the pktmon release from https://github.com/IceDynamix/reliquary-archiver/releases/latest"
+                                            );
                                         }
                                     }
                                     ConnectionPacket::Disconnected => {
@@ -781,10 +793,10 @@ async fn maybe_timeout(timeout: Option<Duration>) -> () {
 fn escalate_to_admin() -> Result<(), Box<dyn std::error::Error>> {
     use std::os::windows::ffi::OsStrExt;
 
-    use windows::core::{w, PCWSTR};
     use windows::Win32::System::Console::GetConsoleWindow;
-    use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SEE_MASK_NO_CONSOLE, SHELLEXECUTEINFOW};
-    use windows::Win32::UI::WindowsAndMessaging::{GetWindow, GW_OWNER, SW_SHOWNORMAL};
+    use windows::Win32::UI::Shell::{SEE_MASK_NO_CONSOLE, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
+    use windows::Win32::UI::WindowsAndMessaging::{GW_OWNER, GetWindow, SW_SHOWNORMAL};
+    use windows::core::{PCWSTR, w};
 
     let args_str = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
 
