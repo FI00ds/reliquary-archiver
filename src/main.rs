@@ -20,7 +20,7 @@ use futures::lock::Mutex as FuturesMutex;
 use futures::{FutureExt, StreamExt, future, select};
 use reliquary::network::command::GameCommandError;
 use reliquary::network::command::command_id::{PlayerLoginFinishScRsp, PlayerLoginScRsp};
-use reliquary::network::{ConnectionPacket, GamePacket, GameSniffer, NetworkError};
+use reliquary::network::{ConnectionPacket, GamePacket, GameSniffer, KcpError, NetworkError};
 use tokio::pin;
 use tracing::instrument::WithSubscriber;
 use tracing::level_filters::LevelFilter;
@@ -722,11 +722,18 @@ async fn live_capture(
                                     }
                                     Err(e) => {
                                         warn!(conv_id, %e);
-                                        if matches!(e, GameCommandError::VersionMismatch) {
-                                            // Client packet was misordered from server packet
-                                            // This will be reprocessed after we receive the new session key
-                                        } else {
-                                            break 'recv;
+                                        match e {
+                                            GameCommandError::DecryptionKeyMissing => {
+                                                // version is not supported, there's no point in capturing
+                                                break 'recv;
+                                            }
+                                            GameCommandError::HeaderTooShort { .. } | GameCommandError::CommandTooShort { .. } => {
+                                                // structural parse errors, ignore
+                                            }
+                                            GameCommandError::VersionMismatch => {
+                                                // Client packet was likely misordered from server packet
+                                                // This will be reprocessed after we receive the new session key
+                                            }
                                         }
                                     }
                                 },
@@ -755,7 +762,34 @@ async fn live_capture(
                                 poisoned_sources.insert(packet.source_id);
                                 continue;
                             }
-                            _ => break 'recv,
+                            NetworkError::Kcp(e) => match e {
+                                KcpError::HeaderTooShort { .. }
+                                | KcpError::SegmentTooShort { .. }
+                                | KcpError::ContentLengthExceedsData { .. }
+                                | KcpError::InvalidSegmentHeader { .. } => {
+                                    // structural parse errors, ignore
+                                }
+                                KcpError::ClientNotConstructed => {}
+                                KcpError::PacketDoesNotBelongToConversation { .. } => {
+                                    // reliquary should assign conversation ids correctly?
+                                    // if it does happen, then something went wrong
+                                    break 'recv;
+                                }
+                                KcpError::InnerKcpError(e) => break 'recv,
+                            },
+                            NetworkError::GameCommand(e) => match e {
+                                GameCommandError::DecryptionKeyMissing => {
+                                    // version is not supported, there's no point in capturing
+                                    break 'recv;
+                                }
+                                GameCommandError::HeaderTooShort { .. } | GameCommandError::CommandTooShort { .. } => {
+                                    // structural parse errors, ignore
+                                }
+                                GameCommandError::VersionMismatch => {
+                                    // Client packet was likely misordered from server packet
+                                    // This will be reprocessed after we receive the new session key
+                                }
+                            },
                         }
                     }
                 }
